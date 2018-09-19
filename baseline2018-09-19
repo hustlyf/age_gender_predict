@@ -1,0 +1,220 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Sep 16 09:19:50 2018
+
+@author: Selina
+"""
+import pandas as pd
+import numpy as np
+from sklearn.cross_validation import train_test_split
+import lightgbm as lgb
+import time
+from datetime import datetime
+import math
+import warnings
+warnings.filterwarnings('ignore')
+from sklearn.preprocessing import LabelEncoder
+
+
+path='/home/liuyifeng/data-mining/age_gender_predict/data/Demo/'
+deviceid_brand=pd.read_csv(path+'deviceid_brand.tsv',sep='\t',names=['device_id','brand','tape'])
+package_start_close=pd.read_csv(path+'deviceid_package_start_close.tsv',sep='\t',names=['device_id','apps','start_time','close_time'])
+#device_id 72727(test+train)的id个数
+deviceid_packages=pd.read_csv(path+'deviceid_packages.tsv',sep='\t',names=['device_id','apps'])
+deviceid_test=pd.read_csv(path+'deviceid_test.tsv',sep='\t',names=['device_id'])
+deviceid_train=pd.read_csv(path+'deviceid_train.tsv',sep='\t',names=['device_id','sex','age'])
+package_label=pd.read_csv(path+'package_label.tsv',sep='\t',names=['apps','category_1','category_2'])  #10368个app
+
+
+"""deviceid_test #没有重复的id,22727,其中有49个id没有brand特征，有22678个特征有brand特征
+deviceid_brand brand有四个缺失值，tape有37个缺失值
+deviceid_packages.shape 72727 
+除了start_close之外，id都没有重复
+缺失值 brand 177,tape 210"""
+
+
+deviceid_train=pd.concat([deviceid_train,deviceid_test])
+
+#品牌数据处理，每个品牌的销量，型号的销量，（后期统一大小写）
+deviceid_brand['brand_count']=deviceid_brand.groupby('brand')['device_id'].transform('count').apply(lambda x:math.log(x+1))
+deviceid_brand['tape_count']=deviceid_brand.groupby('tape')['device_id'].transform('count').apply(lambda x:math.log(x+1))
+
+#进行onehot处理，注意：先转换成统一的大小写再进行处理
+brandencoder = LabelEncoder().fit(deviceid_brand.brand.astype(str))
+deviceid_brand['phone_brand'] = brandencoder.transform(deviceid_brand['brand'].astype(str))
+tape_encoder = LabelEncoder().fit(deviceid_brand.tape.astype(str))
+deviceid_brand['phone_tape'] = tape_encoder.transform(deviceid_brand['tape'].astype(str))
+
+#package_start_close
+#对start-close 表格进行处理，抽取大概千分之一进行处理，用服务器跑全部数据
+package_start_close=package_start_close.sample(n=367200,axis=0,replace=True)
+
+def time2cov(time_):
+    return time.strftime("%Y-%m-%d %w %H:%M:%S",time.localtime(time_/1000))   #13位时间戳转换（年，月，日，周，小时，分钟，秒）
+
+#打开应用的时间（周几，哪天，小时，分钟），精确到分钟
+package_start_close['time']=package_start_close.start_time.apply(time2cov)
+package_start_close['day'] = package_start_close.time.apply(lambda x: int(x[8:10]))
+package_start_close['week']=package_start_close.time.apply(lambda x: int(x[11:13]))
+package_start_close['hour']=package_start_close.time.apply(lambda x: int(x[13:15]))
+package_start_close['minute']=package_start_close.time.apply(lambda x: int(x[16:18]))
+#每周点击每款app的次数，观看时长（小时，分钟单位），观看时间点（比如学生一般是周末看的比较多）；
+#每天点击每款app的次数，观看时长（分钟单位），观看时间点
+#，每周/每天每个app的点击量
+package_start_close['query_week']=package_start_close.groupby(['device_id','week'])['week'].transform('count')
+package_start_close['query_day']=package_start_close.groupby(['device_id','day'])['day'].transform('count')
+package_start_close['apps_week_count']=package_start_close.groupby(['apps','week'])['week'].transform('count')
+package_start_close['apps_day_count']=package_start_close.groupby(['apps','day'])['day'].transform('count')
+#每周/每天的玩的次数，每天每个app玩的次数
+package_start_close['apps_week_query']=package_start_close.groupby(['device_id','apps','week'])['day'].transform('count')
+package_start_close['apps_day_query']=package_start_close.groupby(['device_id','apps','week'])['week'].transform('count')
+#关闭应用的时间，小时和分钟
+package_start_close['time2']=package_start_close.close_time.apply(time2cov)
+package_start_close['hour2']=package_start_close.time2.apply(lambda x: int(x[13:15]))
+package_start_close['minute2']=package_start_close.time2.apply(lambda x: int(x[16:18]))
+
+#计算使用手机的时长（秒为单位）
+def time_long(time1,time2):
+    t1=datetime.utcfromtimestamp(time1/1000)
+    t2=datetime.utcfromtimestamp(time2/1000)
+    return t1-t2
+package_start_close['time_seconds']=package_start_close.apply(lambda x :time_long(x['close_time'],x['start_time']).seconds,axis=1)#最大86399秒
+
+
+#drop多余特征
+package_start_close.drop(['start_time','close_time','time','time2'],inplace=True,axis=1)
+
+#deviceid_packages
+#统计app安装的次数，取top1属性作为特征，top1-5合并作为特征,这一部分的特征提高比较明显
+def app_feature(data):
+    tmp=data['apps'].apply(lambda x:x.split(',')).values
+    app_dict={}
+    app_list=[]
+    for i in tmp:
+        app_list+=i
+    for i in app_list:
+        if i in app_dict:
+            app_dict[i]+=1
+        else:
+            app_dict[i]=1
+    print('finished dict')
+    def top(x):
+        app_s=x.split(',')
+        cnt=[app_dict[i] for i in app_s]
+        res=sorted(zip(app_s,cnt),key=lambda x:x[1],reverse=True)#从大到小排序
+        top1=res[0][0]   #top1特征   
+        top2='_'.join(i[0] for i in res[:2])# top1_top2特征
+        top3 = '_'.join([i[0] for i in res[:3]])#top 1_2_3
+        top4 = '_'.join([i[0] for i in res[:4]])
+        top5='_'.join([i[0] for i in res[:5]])
+        top10 = '_'.join([i[0] for i in res[:10]])
+        return (top1,top2,top3,top4,top5,top10)
+    data['top']=data['apps'].apply(top)
+    print('finished top')
+    data['top1']=data['top'].apply(lambda x:x[0])
+    data['top2']=data['top'].apply(lambda x: x[1])
+    data['top3']=data['top'].apply(lambda x: x[2])
+    data['top4']=data['top'].apply(lambda x: x[3])
+    data['top5']=data['top'].apply(lambda x: x[4])
+    data['top10']=data['top'].apply(lambda x: x[5])
+    return data[['device_id','top1','top2','top3','top4','top5','top10']]
+app_feature(deviceid_packages)
+#统计一个设备安装了多少个app
+deviceid_packages['apps_']=deviceid_packages['apps'].apply(lambda x:x.split(','))
+deviceid_packages['app_lenghth']=deviceid_packages['apps_'].apply(lambda x:len(x))#安装app的个数
+#最多174，众数5，平均值10
+#onehot编码
+features=['top1','top2','top3','top4','top5','top10']
+for feature in features:
+    deviceid_packages[feature]=LabelEncoder().fit(deviceid_packages[feature].astype(str)).transform(deviceid_packages[feature].astype(str))
+deviceid_packages.drop(['apps','apps_','top'],inplace=True,axis=1)
+
+ #package_label
+cate1_encoder = LabelEncoder().fit(package_label.category_1.astype(str))
+package_label['cate1_enc'] = cate1_encoder.transform(package_label['category_1'].astype(str))
+cate2_encoder = LabelEncoder().fit(package_label.category_2.astype(str))
+package_label['cate2_enc'] = cate2_encoder.transform(package_label['category_2'].astype(str))
+
+package_start_close=pd.merge(package_start_close,package_label,on='apps',how='left')
+#  left时35000个app， outer时35019个app,标记的样本中有19个没有在start_close中出现
+
+app_encoder=LabelEncoder().fit(package_start_close.apps.astype(str))
+package_start_close['app_enc'] = app_encoder.transform(package_start_close.apps.astype(str))
+package_start_close.drop('apps',axis=1,inplace=True)
+
+train=pd.merge(deviceid_train,package_start_close,on='device_id',how='left')
+train=pd.merge(train,deviceid_brand,on='device_id',how='left')
+train=pd.merge(train,deviceid_packages,on='device_id',how='left')
+"""#app每周/每天观看次数在品牌/型号下的排名特征，
+def rank_feature(data):
+    data['app_week_brand_rank']=data.groupby('brand')['apps_week_query'].rank(ascending=False,method='dense')
+    data['app_week_tape_rank']=data.groupby('tape')['apps_week_query'].rank(ascending=False,method='dense')
+    data['app_day_brand_rank']=data.groupby('brand')['apps_day_query'].rank(ascending=False,method='dense')
+    data['app_day_tape_rank']=data.groupby('tape')['apps_day_query'].rank(ascending=False,method='dense') 
+rank_feature(train)"""
+#排名特征加上以后效果反而不好
+#package_start_close 里面有很多重复的device_id，暂时不知道怎么合并 ，先按照这种方式合并
+train.drop_duplicates('device_id', keep='first', inplace=True)
+deviceid_train=train
+
+deviceid_train['sex']=deviceid_train['sex'].apply(lambda x:str(x))
+deviceid_train['age']=deviceid_train['age'].apply(lambda x:str(x))
+def tool(x):
+    if x=='nan':
+        return x
+    else:
+        return str(int(float(x)))
+deviceid_train['sex']=deviceid_train['sex'].apply(tool)
+deviceid_train['age']=deviceid_train['age'].apply(tool)
+deviceid_train['sex_age']=deviceid_train['sex']+'-'+deviceid_train['age']
+
+deviceid_train=deviceid_train.replace({'nan':np.NaN,'nan-nan':np.NaN})
+train=deviceid_train[deviceid_train['sex'].notnull()]
+test=deviceid_train[deviceid_train['sex'].isnull()]
+
+X=train.drop(['sex','age','sex_age','device_id','brand', 'tape','category_1', 'category_2'],axis=1)
+Y=train['sex_age']
+pre_x=test.drop(['sex','age','sex_age','device_id','brand', 'tape','category_1', 'category_2'],axis=1)
+#保留训练数据
+X.to_csv('X_train',index=False)
+Y.to_csv('Y_train',index=False)
+pre_x.to_csv('X_test',index=False)
+
+
+Y_CAT=pd.Categorical(Y)
+X_train,X_test, y_train, y_test =train_test_split(X,Y_CAT.labels,test_size=0.3, random_state=666)
+lgb_train=lgb.Dataset(X_train,label=y_train)
+lgb_eval = lgb.Dataset(X_test, y_test, reference=lgb_train)
+
+params = {
+    'boosting_type': 'gbdt',
+    'max_depth':3,
+    'metric': {'multi_logloss'},
+    'num_class':22,
+    'objective':'multiclass',
+    'random_state':666,
+    
+}
+gbm = lgb.train(params,
+lgb_train,
+num_boost_round=1000,
+valid_sets=lgb_eval,
+early_stopping_rounds=300)
+
+sub=pd.DataFrame(gbm.predict(pre_x.values,num_iteration=gbm.best_iteration))
+sub.columns=Y_CAT.categories
+sub['DeviceID']=test['device_id'].values
+sub=sub[['DeviceID', '1-0', '1-1', '1-2', '1-3', '1-4', '1-5', '1-6', '1-7','1-8', '1-9', '1-10', '2-0', '2-1', '2-2', '2-3', '2-4', '2-5', '2-6', '2-7', '2-8', '2-9', '2-10']]
+sub.to_csv('baseline.csv',index=False) 
+
+
+
+
+
+
+
+
+
+
+
+
